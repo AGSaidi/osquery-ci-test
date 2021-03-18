@@ -332,3 +332,150 @@ jobs:
           -DOSQUERY_BUILD_TESTS=${{ steps.tests_build_settings.outputs.VALUE }} \
           -DOSQUERY_BUILD_ROOT_TESTS=${{ steps.tests_build_settings.outputs.VALUE }} \
           "${{ steps.build_paths.outputs.SOURCE }}"
+
+
+  start_aarch64_runner:
+    name: Start AARCH64 EC2 runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start_ec2_runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start_ec2_runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.EC2_GITHUB_RUNNER_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.EC2_GITHUB_RUNNER_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.EC2_GITHUB_RUNNER_AWS_REGION }}
+      - name: Start AARCH64 EC2 runner
+        id: start_ec2_runner
+        uses: theopolis/ec2-github-runner@main
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_GITHUB_RUNNER_GH_PERSONAL_ACCESS_TOKEN }}
+          ec2-image-id: ami-063d99d9ce1bebbe8
+          ec2-instance-type: r6g.4xlarge
+          subnet-id: subnet-06390365e72579736
+          security-group-id: sg-0757a3162c999331b
+
+  stop_aarch64_runner:
+    name: Stop AARCH64 EC2 runner
+    needs:
+      - start_aarch64_runner # required to get output from the start-runner job
+      - build_linux_aarch64 # required to wait when the main job is done
+    runs-on: ubuntu-latest
+    if: ${{ always() }} # required to stop the runner even if the error happened in the previous jobs
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.EC2_GITHUB_RUNNER_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.EC2_GITHUB_RUNNER_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.EC2_GITHUB_RUNNER_AWS_REGION }}
+      - name: Stop AARCH64 EC2 runner
+        uses: theopolis/ec2-github-runner@main
+        with:
+          mode: stop
+          github-token: ${{ secrets.EC2_GITHUB_RUNNER_GH_PERSONAL_ACCESS_TOKEN }}
+          label: ${{ needs.start_aarch64_runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start_aarch64_runner.outputs.ec2-instance-id }}
+
+  # The Linux build will only start once we know that the code
+  # has been properly formatted
+  build_linux_aarch64:
+    needs:
+     - check_code_style
+     - start_aarch64_runner
+
+    runs-on: ${{ needs.start_aarch64_runner.outputs.label }}
+
+    steps:
+    - name: Clone the osquery repository
+      uses: actions/checkout@v1
+
+    - name: Select the build job count
+      shell: bash
+      id: build_job_count
+      run: |
+        echo ::set-output name=VALUE::$(($(nproc) + 1))
+
+    - name: Select the build options for the tests
+      shell: bash
+      id: tests_build_settings
+      run: |
+        echo ::set-output name=VALUE::OFF
+
+    # We don't have enough space on the worker to actually generate all
+    # the debug symbols (osquery + dependencies), so we have a flag to
+    # disable them when running a Debug build
+    - name: Select the debug symbols options
+      shell: bash
+      id: debug_symbols_settings
+      run: |
+        echo ::set-output name=VALUE::OFF
+
+    # Due to how the RPM packaging tools work, we have to adhere to some
+    # character count requirements in the build path vs source path.
+    #
+    # Failing to do so, will break the debuginfo RPM package.
+    - name: Setup the build paths
+      id: build_paths
+      run: |
+        rel_build_path="workspace/usr/src/debug/osquery/build"
+        rel_src_path="workspace/padding-required-by-rpm-packages/src"
+        rel_ccache_path="workspace/ccache"
+
+        mkdir -p ${rel_build_path} \
+                 ${rel_src_path} \
+                 ${rel_ccache_path} \
+                 ${rel_src_path}
+
+        mv .git "${rel_src_path}"
+        ( cd "${rel_src_path}" && git reset --hard )
+
+        echo ::set-output name=SOURCE::$(realpath ${rel_src_path})
+        echo ::set-output name=BINARY::$(realpath ${rel_build_path})
+        echo ::set-output name=REL_BINARY::${rel_build_path}
+        echo ::set-output name=CCACHE::$(realpath ${rel_ccache_path})
+
+    - name: Update the cache (ccache)
+      uses: actions/cache@v2
+      with:
+        path: ${{ steps.build_paths.outputs.CCACHE }}
+
+        key: |
+          ccache_linux_aarch64_RelWithDebInfo_${{ github.sha }}
+
+        restore-keys: |
+          ccache_linux_aarch64_RelWithDebInfo
+
+    - name: Update the cache (git submodules)
+      uses: actions/cache@v2
+      with:
+        path: ${{ steps.build_paths.outputs.SOURCE }}/.git/modules
+
+        key: |
+          gitmodules_linux_aarch64_${{ github.sha }}
+
+        restore-keys: |
+          gitmodules_linux_aarch64
+
+    - name: Update the git submodules
+      working-directory: ${{ steps.build_paths.outputs.SOURCE }}
+      run: |
+        git submodule sync --recursive
+
+    - name: Configure the project
+      working-directory: ${{ steps.build_paths.outputs.BINARY }}
+
+      env:
+        CCACHE_DIR: ${{ steps.build_paths.outputs.CCACHE }}
+
+      run: |
+        cmake -G "Unix Makefiles" \
+          -DOSQUERY_NO_DEBUG_SYMBOLS=${{ steps.debug_symbols_settings.outputs.VALUE }} \
+          -DOSQUERY_TOOLCHAIN_SYSROOT:PATH="/usr/local/osquery-toolchain" \
+          -DCMAKE_BUILD_TYPE:STRING="RelWithDebInfo" \
+          -DOSQUERY_BUILD_TESTS=${{ steps.tests_build_settings.outputs.VALUE }} \
+          -DOSQUERY_BUILD_ROOT_TESTS=${{ steps.tests_build_settings.outputs.VALUE }} \
+          "${{ steps.build_paths.outputs.SOURCE }}"
